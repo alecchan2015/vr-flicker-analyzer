@@ -18,7 +18,7 @@ export interface TaskResult {
   error?: string
 }
 
-const API_BASE = (import.meta.env.VITE_API_BASE as string) || 'http://localhost:5050'
+const API_BASE = (import.meta.env.VITE_API_BASE as string) ?? ''
 
 export default function App() {
   const [mode, setMode] = useState<Mode>('single')
