@@ -116,6 +116,140 @@ def hf_stability_label(score):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 画面撕裂 (Tearing) — 行级稠密光流
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_tearing_row_flow(prev_gray, curr_gray, downscale=2):
+    """对一对相邻帧计算行平均水平光流 dx[y]，返回长度 = H/downscale 的数组。"""
+    if downscale > 1:
+        h = prev_gray.shape[0] // downscale
+        w = prev_gray.shape[1] // downscale
+        p = cv2.resize(prev_gray, (w, h), interpolation=cv2.INTER_AREA)
+        c = cv2.resize(curr_gray, (w, h), interpolation=cv2.INTER_AREA)
+    else:
+        p, c = prev_gray, curr_gray
+    flow = cv2.calcOpticalFlowFarneback(
+        p, c, None,
+        pyr_scale=0.5, levels=3, winsize=15,
+        iterations=3, poly_n=5, poly_sigma=1.2, flags=0,
+    )
+    return flow[..., 0].mean(axis=1)
+
+
+def detect_tearing(frames_gray, motion_thresh=0.3, seam_thresh=1.5, downscale=2):
+    """
+    撕裂检测：对每对相邻帧计算行级水平光流 dx[y]，
+    在「有运动」帧中寻找 |Δdx| 突变行；连续突变即视为撕裂接缝。
+
+    返回:
+        per_frame_seams: list[int]  每帧最强接缝幅值（无撕裂为 0）
+        tearing_score:   float      撕裂帧占比 × 平均接缝幅值
+        tear_frame_ratio:float      出现撕裂的帧占比 (%)
+        mean_seam_mag:   float      撕裂帧的平均接缝幅值 (px)
+    """
+    n = len(frames_gray)
+    if n < 2:
+        return [], 0.0, 0.0, 0.0
+
+    per_frame_seams = [0.0]
+    seam_mags = []
+    for i in range(1, n):
+        try:
+            dx_row = compute_tearing_row_flow(frames_gray[i-1], frames_gray[i], downscale)
+        except cv2.error:
+            per_frame_seams.append(0.0)
+            continue
+
+        global_motion = float(np.mean(np.abs(dx_row)))
+        if global_motion < motion_thresh:
+            per_frame_seams.append(0.0)
+            continue
+
+        d2 = np.abs(np.diff(dx_row))
+        if d2.size == 0:
+            per_frame_seams.append(0.0)
+            continue
+
+        max_seam = float(np.max(d2))
+        if max_seam > seam_thresh:
+            per_frame_seams.append(max_seam)
+            seam_mags.append(max_seam)
+        else:
+            per_frame_seams.append(0.0)
+
+    tear_frames = sum(1 for s in per_frame_seams if s > 0)
+    tear_frame_ratio = tear_frames / max(1, n) * 100
+    mean_seam_mag = float(np.mean(seam_mags)) if seam_mags else 0.0
+    tearing_score = (tear_frame_ratio / 100.0) * mean_seam_mag
+    return per_frame_seams, float(tearing_score), float(tear_frame_ratio), mean_seam_mag
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 统一严重程度评级（5 项指标 + 综合）
+# ─────────────────────────────────────────────────────────────────────────────
+
+SEVERITY_LEVELS = ['Excellent', 'Good', 'Moderate', 'Severe', 'Critical']
+
+# 每项指标的 4 个阈值：[Excellent|Good|Moderate|Severe|Critical]
+SEVERITY_THRESHOLDS = {
+    'percent_flicker':      [8, 20, 40, 70],
+    'edge_percent_flicker': [5, 12, 25, 45],
+    'hf_stability_cv':      [2, 5, 10, 20],
+    'aliasing_ratio_mean':  [8, 15, 25, 40],
+    'tearing_score':        [0.5, 2, 5, 10],
+}
+
+# 综合评分时各项权重（和为 1.0）
+SEVERITY_WEIGHTS = {
+    'percent_flicker':      0.25,
+    'edge_percent_flicker': 0.25,
+    'hf_stability_cv':      0.15,
+    'aliasing_ratio_mean':  0.15,
+    'tearing_score':        0.20,
+}
+
+
+def grade_metric(metric_name, value):
+    """根据阈值表把数值映射到 5 档严重程度。"""
+    th = SEVERITY_THRESHOLDS.get(metric_name)
+    if th is None:
+        return 'Unknown'
+    for i, t in enumerate(th):
+        if value < t:
+            return SEVERITY_LEVELS[i]
+    return SEVERITY_LEVELS[-1]
+
+
+def _level_index(level):
+    try:
+        return SEVERITY_LEVELS.index(level)
+    except ValueError:
+        return 0
+
+
+def overall_severity(metric_values):
+    """按权重加权五项指标的档位索引，得到综合等级与 0-100 分。"""
+    weighted = 0.0
+    total_w = 0.0
+    breakdown = {}
+    for k, v in metric_values.items():
+        if k not in SEVERITY_WEIGHTS:
+            continue
+        level = grade_metric(k, v)
+        idx = _level_index(level)
+        w = SEVERITY_WEIGHTS[k]
+        weighted += idx * w
+        total_w += w
+        breakdown[k] = {'value': float(v), 'level': level}
+    if total_w <= 0:
+        return {'level': 'Unknown', 'score': 0.0, 'breakdown': breakdown}
+    avg_idx = weighted / total_w
+    level = SEVERITY_LEVELS[min(int(round(avg_idx)), len(SEVERITY_LEVELS) - 1)]
+    score = avg_idx / (len(SEVERITY_LEVELS) - 1) * 100
+    return {'level': level, 'score': round(score, 2), 'breakdown': breakdown}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 文字边缘锯齿 (Aliasing)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -347,6 +481,21 @@ def analyze_video(video_path, output_dir, device_name="Device", max_frames=300,
     tr_mean = float(np.mean(transition_series))
     sc_mean = float(np.mean(sharpness_series))
 
+    # 撕裂检测（使用全帧灰度图，不裁 ROI——撕裂常出现在画面任意位置）
+    seam_series, tearing_score, tear_frame_ratio, mean_seam_mag = detect_tearing(frames_gray)
+    if progress_callback:
+        progress_callback(0.92)
+
+    # 统一严重程度评级
+    metric_values = {
+        'percent_flicker':      pf,
+        'edge_percent_flicker': e_pf,
+        'hf_stability_cv':      hf_cv,
+        'aliasing_ratio_mean':  ali_mean,
+        'tearing_score':        tearing_score,
+    }
+    severity = overall_severity(metric_values)
+
     result = {
         "device": device_name,
         "video": os.path.basename(video_path),
@@ -379,11 +528,28 @@ def analyze_video(video_path, output_dir, device_name="Device", max_frames=300,
         "aliasing_temporal_cv": round(ali_cv, 4),
         "edge_transition_ratio": round(tr_mean, 4),
         "edge_sharpness_cv": round(sc_mean, 4),
+        # 撕裂
+        "tearing_score": round(tearing_score, 4),
+        "tear_frame_ratio": round(tear_frame_ratio, 2),
+        "mean_seam_magnitude_px": round(mean_seam_mag, 4),
+        "tearing_label": grade_metric('tearing_score', tearing_score),
+        # 五项独立评级
+        "severity": {
+            "percent_flicker":      grade_metric('percent_flicker', pf),
+            "edge_percent_flicker": grade_metric('edge_percent_flicker', e_pf),
+            "hf_stability_cv":      grade_metric('hf_stability_cv', hf_cv),
+            "aliasing_ratio_mean":  grade_metric('aliasing_ratio_mean', ali_mean),
+            "tearing_score":        grade_metric('tearing_score', tearing_score),
+        },
+        # 综合评级（加权）
+        "overall_severity": severity['level'],
+        "overall_score": severity['score'],
         # 时序数据（用于绘图）
         "_lum_series": lum_arr.tolist(),
         "_edge_series": edge_arr.tolist(),
         "_hf_series": hf_arr.tolist(),
         "_aliasing_series": ali_arr.tolist(),
+        "_seam_series": list(seam_series),
     }
 
     # 生成可视化图表
@@ -524,15 +690,17 @@ def _generate_chart(result, output_dir, device_name):
     # 6. 数据汇总
     ax = axes[1, 2]
     ax.axis('off')
+    sev = result.get('severity', {})
     table_data = [
         ['指标', '数值', '评级'],
-        ['Percent Flicker', f"{result['percent_flicker']:.4f}%", result['flicker_label']],
-        ['Edge Flicker', f"{result['edge_percent_flicker']:.4f}%", result['edge_flicker_label']],
-        ['Temporal Contrast', f"{result['temporal_contrast']:.4f}", '-'],
-        ['HF Stability CV', f"{result['hf_stability_cv']:.2f}%", result['hf_stability_label']],
-        ['Aliasing Ratio', f"{result['aliasing_ratio_mean']:.2f}%", '-'],
-        ['Edge Transition', f"{result['edge_transition_ratio']:.2f}", '-'],
-        ['主频', f"{result['dominant_freq_hz']:.1f}Hz", '-'],
+        ['Percent Flicker', f"{result['percent_flicker']:.2f}%", sev.get('percent_flicker', '-')],
+        ['Edge Flicker',    f"{result['edge_percent_flicker']:.2f}%", sev.get('edge_percent_flicker', '-')],
+        ['HF Stability CV', f"{result['hf_stability_cv']:.2f}%",   sev.get('hf_stability_cv', '-')],
+        ['Aliasing Ratio',  f"{result['aliasing_ratio_mean']:.2f}%", sev.get('aliasing_ratio_mean', '-')],
+        ['Tearing Score',   f"{result['tearing_score']:.2f}",       sev.get('tearing_score', '-')],
+        ['Tear Frame %',    f"{result['tear_frame_ratio']:.1f}%",   '-'],
+        ['主频',            f"{result['dominant_freq_hz']:.1f}Hz",  '-'],
+        ['综合',            f"{result.get('overall_score', 0):.1f}", result.get('overall_severity', '-')],
     ]
     table = ax.table(cellText=table_data[1:], colLabels=table_data[0],
                      cellLoc='center', loc='center', bbox=[0, 0, 1, 1])

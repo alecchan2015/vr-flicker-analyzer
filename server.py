@@ -21,6 +21,16 @@ from werkzeug.utils import secure_filename
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'backend'))
 from analyzer import analyze_video, compare_videos, img_to_base64
 
+# Agent 模块（设备直采）
+sys.path.insert(0, os.path.dirname(__file__))
+try:
+    from agent.device_manager import list_devices as _list_devices, ADBError
+    from agent.capturer import Capturer, CaptureConfig, CaptureError
+    _AGENT_OK = True
+except Exception as _e:  # 缺少 adb/scrcpy 时不影响上传式分析
+    _AGENT_OK = False
+    _AGENT_IMPORT_ERR = str(_e)
+
 # ─── 路径配置 ────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
 STATIC_DIR = BASE_DIR / 'frontend' / 'dist'
@@ -171,6 +181,102 @@ def get_task(task_id):
     if not task:
         return jsonify({'error': '任务不存在'}), 404
     return jsonify(task)
+
+
+# ─── Agent: 设备直采 ──────────────────────────────────────────────────────────
+
+@app.route('/api/devices')
+def api_devices():
+    if not _AGENT_OK:
+        return jsonify({'error': f'Agent 模块不可用: {_AGENT_IMPORT_ERR}'}), 503
+    try:
+        devices = [d.to_dict() for d in _list_devices()]
+    except ADBError as e:
+        return jsonify({'error': str(e)}), 500
+    return jsonify({'devices': devices})
+
+
+def _run_capture(task_id, cfg: 'CaptureConfig', device_name: str, out_dir: Path):
+    """子线程：scrcpy 录制 → 分析。"""
+    try:
+        set_task(task_id, phase='capturing', progress=0)
+        cap = Capturer(cfg)
+        cap.start()
+        start_ts = time.time()
+        # 录制阶段进度（0~40%）
+        while time.time() - start_ts < cfg.duration_s and cap.running:
+            elapsed = time.time() - start_ts
+            set_task(task_id, progress=round(min(elapsed / cfg.duration_s, 1.0) * 40, 1))
+            time.sleep(0.5)
+        cap.stop()
+
+        if not os.path.exists(cfg.output_path) or os.path.getsize(cfg.output_path) < 1024:
+            raise CaptureError(f'录制文件无效: {cfg.output_path}')
+
+        set_task(task_id, phase='analyzing', progress=40)
+
+        def prog(p):
+            set_task(task_id, progress=round(40 + p * 60, 1))
+
+        result = analyze_video(
+            video_path=cfg.output_path,
+            output_dir=str(out_dir),
+            device_name=device_name,
+            max_frames=300,
+            progress_callback=prog,
+        )
+        chart_b64 = img_to_base64(result['chart_path']) if os.path.exists(result.get('chart_path', '')) else None
+        clean = {k: v for k, v in result.items() if not k.startswith('_') and k != 'chart_path' and k != 'json_path'}
+        set_task(task_id, status='done', phase='done', progress=100,
+                 mode='capture', result=clean, chart_b64=chart_b64)
+    except (CaptureError, ADBError, Exception) as e:
+        set_task(task_id, status='error', error=str(e))
+    finally:
+        try:
+            os.remove(cfg.output_path)
+        except Exception:
+            pass
+
+
+@app.route('/api/capture/start', methods=['POST'])
+def api_capture_start():
+    if not _AGENT_OK:
+        return jsonify({'error': f'Agent 模块不可用: {_AGENT_IMPORT_ERR}'}), 503
+    data = request.get_json(silent=True) or {}
+    serial = (data.get('serial') or '').strip()
+    if not serial:
+        return jsonify({'error': '缺少 serial'}), 400
+    duration = float(data.get('duration', 10))
+    if not (1 <= duration <= 120):
+        return jsonify({'error': 'duration 需在 1~120 秒之间'}), 400
+    max_size = int(data.get('max_size', 1280))
+    bit_rate = str(data.get('bit_rate', '8M'))
+    fps = data.get('fps')
+    name = (data.get('name') or serial).strip()
+
+    task_id = str(uuid.uuid4())
+    video_path = UPLOAD_DIR / f'{task_id}_capture.mp4'
+    out_dir = OUTPUT_DIR / task_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cfg = CaptureConfig(
+        serial=serial,
+        output_path=str(video_path),
+        duration_s=duration,
+        max_size=max_size,
+        bit_rate=bit_rate,
+        fps=int(fps) if fps else None,
+    )
+
+    with tasks_lock:
+        tasks[task_id] = {
+            'status': 'running', 'mode': 'capture', 'phase': 'starting',
+            'progress': 0, 'created_at': time.time(),
+            'serial': serial, 'duration': duration,
+        }
+
+    threading.Thread(target=_run_capture, args=(task_id, cfg, name, out_dir), daemon=True).start()
+    return jsonify({'task_id': task_id})
 
 
 # ─── 前端静态文件托管 ──────────────────────────────────────────────────────────
